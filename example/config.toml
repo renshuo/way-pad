@@ -1,0 +1,67 @@
+# way-pad 配置示例
+# 复制到 ~/.config/way-pad/config.toml 后按需修改；
+# 每个字段都有默认值，省略即用默认。
+
+# 隐藏窗口的后端：
+#   auto             — 是 driftwm 会话就用 driftwm IPC（移出画布隐藏），
+#                      否则用 foreign-toplevel 协议（最小化）
+#   driftwm          — 强制 driftwm IPC
+#   foreign-toplevel — 强制标准协议（wlroots/smithay 系合成器）
+backend = "auto"
+
+# 显示器分辨率（屏幕像素）：driftwm 后端用于判断窗口是否在当前视野内、
+# 以及 fullscreen 的目标尺寸
+viewport = [1920, 1080]
+
+# launch 启动后等待匹配窗口出现的毫秒数
+launch_wait_ms = 1500
+
+# ---------------------------------------------------------------------------
+# 每个 [pads.<名字>] 定义一个 pad：一组可整体显示/隐藏的窗口。
+#
+#   app_id        匹配窗口 app_id 的正则表达式（必填）
+#   title         匹配窗口标题的正则表达式（可选，省略或留空 = 不限定）
+#   launch        没有匹配窗口时启动的命令，经 sh -c 执行（可选）
+#   focus_on_show 显示时是否聚焦窗口（默认 true）
+#
+# 窗口几何（仅 driftwm 后端支持；单位均为屏幕像素）：
+#   width         显示时的窗口宽度（省略则保持当前宽度）
+#   height        显示时的窗口高度（省略则保持当前高度）
+#   edge          停靠边：top / bottom / left / right / center（默认 top）
+#   margin        距视野边缘的边距（默认 0）
+#   fullscreen    显示时占满当前视野；为 true 时忽略上面四项
+#
+# 显示时窗口总是出现在当前视野的对应位置；隐藏期间即使移动了视野，
+# 窗口也会被带到眼前。width/height/edge/margin 全部省略时保持窗口原样。
+#
+# 提示：先运行 `way-pad list` 查看各窗口实际的 app_id / title。
+# 一个 pad 匹配多个窗口时，它们会被当作一组一起切换。
+# ---------------------------------------------------------------------------
+
+# 下拉终端：贴屏幕顶部、距顶边 24px、高 600，宽度保持不变
+[pads.term]
+app_id = '^foot$'
+launch = 'foot'
+edge = "top"
+margin = 24
+height = 600
+
+# 编辑器：1600x900 居中
+[pads.editor]
+app_id = '^way-pad-emacs$'
+launch = 'emacs --name way-pad-emacs'
+width = 1600
+height = 900
+edge = "center"
+
+# 全屏 pad：显示时占满当前视野
+[pads.calc]
+app_id = '^gnome-calculator$'
+launch = 'gnome-calculator'
+fullscreen = true
+
+# 不需要几何控制的窗口：只写匹配规则即可
+[pads.music]
+app_id = '^mpv$'
+title = '^mpv —'
+launch = 'mpv --player-operation-mode=pseudo-gui'
