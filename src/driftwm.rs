@@ -1,11 +1,12 @@
 //! driftwm 专属后端：通过 `driftwm msg` IPC 控制窗口。
 //!
 //! driftwm 是无限画布合成器，没有最小化概念（foreign-toplevel 的
-//! set_minimized 是 no-op）。隐藏语义实现为"把窗口移到画布极远的藏匿点"，
-//! 显示时移回隐藏前记录的位置（或当前视野中心）并聚焦。
+//! set_minimized 是 no-op）。隐藏语义有两种实现：
+//! - `move`（默认）：把窗口移到画布极远的藏匿点，显示时移回；
+//! - `opacity`：窗口原地全透明（注意透明窗口通常仍会拦截鼠标点击）。
 
 use crate::backend::{Backend, Win};
-use crate::config::{Edge, Pad};
+use crate::config::{Edge, HideMode, Pad};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant};
 
 /// 藏匿点：无限画布上一个实际使用中不可能出现的坐标。
 /// 要足够远——driftwm 的 window_placement=auto 会吸附"相邻集群"，
-/// 藏匿窗口太近会把新窗口吸到屏幕外（实测 1e6 处曾被吸到 22 万）。
+/// 藏匿窗口太近会把新窗口吸到屏幕外。
 const HIDE_SPOT: (f64, f64) = (100_000_000.0, 100_000_000.0);
 /// 判定窗口是否已在藏匿点附近的容差
 const HIDE_SPOT_TOLERANCE: f64 = 5000.0;
@@ -30,14 +31,7 @@ pub struct DriftSession {
     positions_path: PathBuf,
     /// 视口尺寸（物理像素），用于判断窗口是否在当前视野内
     viewport: (f64, f64),
-}
-
-/// 无限画布上 tdrop 的核心体验：窗口恢复位置若不在当前视野内，
-/// 就把它带到视野中心，保证按快捷键后总能看到它
-fn in_viewport(pos: (f64, f64), cam: (f64, f64), zoom: f64, viewport: (f64, f64)) -> bool {
-    let zoom = zoom.max(0.1);
-    let (hw, hh) = (viewport.0 * 0.55 / zoom, viewport.1 * 0.55 / zoom);
-    (pos.0 - cam.0).abs() <= hw && (pos.1 - cam.1).abs() <= hh
+    hide_mode: HideMode,
 }
 
 /// `driftwm msg state --json` 的回复：{"Ok": {"State": {...}}}
@@ -78,6 +72,41 @@ struct DriftWindow {
     size: Vec<f64>,
     #[serde(default)]
     is_focused: bool,
+    #[serde(default)]
+    is_widget: bool,
+    #[serde(default)]
+    suspended: bool,
+}
+
+/// pad -> 窗口 id -> 该窗口的 pad 记录
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Positions(BTreeMap<String, BTreeMap<String, PadWinState>>);
+
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct PadWinState {
+    /// 隐藏前位置（move 模式记录，show 时移回）
+    #[serde(default)]
+    pos: Option<(f64, f64)>,
+    /// opacity 模式下窗口处于透明隐藏状态
+    #[serde(default)]
+    opacity_hidden: bool,
+}
+
+fn xy(v: &[f64]) -> (f64, f64) {
+    (
+        v.first().copied().unwrap_or(0.0),
+        v.get(1).copied().unwrap_or(0.0),
+    )
+}
+
+fn in_hide_spot((x, y): (f64, f64)) -> bool {
+    (x - HIDE_SPOT.0).abs() <= HIDE_SPOT_TOLERANCE && (y - HIDE_SPOT.1).abs() <= HIDE_SPOT_TOLERANCE
+}
+
+fn in_viewport(pos: (f64, f64), cam: (f64, f64), zoom: f64, viewport: (f64, f64)) -> bool {
+    let zoom = zoom.max(0.1);
+    let (hw, hh) = (viewport.0 * 0.55 / zoom, viewport.1 * 0.55 / zoom);
+    (pos.0 - cam.0).abs() <= hw && (pos.1 - cam.1).abs() <= hh
 }
 
 /// 按停靠边计算窗口中心（画布坐标）。margin/w/h 均为屏幕像素，
@@ -106,19 +135,6 @@ fn edge_position(
     }
 }
 
-/// pad -> 窗口 id -> 隐藏前的画布位置
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct Positions(BTreeMap<String, BTreeMap<String, (f64, f64)>>);
-
-fn xy(v: &[f64]) -> (f64, f64) {
-    (v.first().copied().unwrap_or(0.0), v.get(1).copied().unwrap_or(0.0))
-}
-
-fn in_hide_spot((x, y): (f64, f64)) -> bool {
-    (x - HIDE_SPOT.0).abs() <= HIDE_SPOT_TOLERANCE
-        && (y - HIDE_SPOT.1).abs() <= HIDE_SPOT_TOLERANCE
-}
-
 fn cache_dir() -> Option<PathBuf> {
     let base = std::env::var("XDG_CACHE_HOME")
         .ok()
@@ -140,13 +156,14 @@ impl DriftSession {
             .unwrap_or(false)
     }
 
-    pub fn new(viewport: Option<(f64, f64)>) -> Result<Self> {
+    pub fn new(viewport: Option<(f64, f64)>, hide_mode: HideMode) -> Result<Self> {
         let path = cache_dir()
             .context("无法确定缓存目录（XDG_CACHE_HOME/HOME 未设置）")?
             .join("positions.json");
         Ok(DriftSession {
             positions_path: path,
             viewport: viewport.unwrap_or((1920.0, 1080.0)),
+            hide_mode,
         })
     }
 
@@ -161,8 +178,7 @@ impl DriftSession {
         if let Some(err) = v.err {
             bail!("driftwm msg state 失败: {err}");
         }
-        v.ok
-            .and_then(|p| p.state)
+        v.ok.and_then(|p| p.state)
             .context("driftwm msg state 返回缺少 State 字段")
     }
 
@@ -184,6 +200,38 @@ impl DriftSession {
         Ok(())
     }
 
+    /// driftwm IPC 的坐标/尺寸参数只接受整数，f64 一律四舍五入
+    fn fmt_i(v: f64) -> String {
+        format!("{}", v.round() as i64)
+    }
+
+    fn move_to(&self, id: &str, (x, y): (f64, f64)) -> Result<()> {
+        self.msg(&["move", "--id", id, &Self::fmt_i(x), &Self::fmt_i(y)])
+    }
+
+    fn resize_to(&self, id: &str, (w, h): (f64, f64)) -> Result<()> {
+        self.msg(&["resize", "--id", id, &Self::fmt_i(w), &Self::fmt_i(h)])
+    }
+
+    fn set_camera(&self, (x, y): (f64, f64)) -> Result<()> {
+        self.msg(&["camera", &Self::fmt_i(x), &Self::fmt_i(y)])
+    }
+
+    fn set_opacity(&self, id: &str, value: u32) -> Result<()> {
+        self.msg(&["opacity", "--id", id, &value.to_string()])
+    }
+
+    /// 聚焦窗口。实测 driftwm 的 `focus --id` 路径对部分客户端（如 emacs）
+    /// 不生效，而按 app_id 子串的路径有效，故优先用 app_id；没有 app_id 的
+    /// 窗口（如部分 XWayland 窗口）退回 --id。
+    fn focus(&self, win: &Win) -> Result<()> {
+        if win.app_id.is_empty() {
+            self.msg(&["focus", "--id", &win.key])
+        } else {
+            self.msg(&["focus", &win.app_id])
+        }
+    }
+
     /// 聚焦窗口。driftwm 的 focus 会把视口平移到聚焦窗口（居中），
     /// 破坏 edge/贴边定位。相机平移是约 300ms 的动画，动画期间 camera
     /// 返回中间帧——等动画结束再校验，若相机被拖离则移回 focus 前位置
@@ -202,36 +250,9 @@ impl DriftSession {
     }
 
     /// 运行一个配置动作（作用于聚焦窗口），如 toggle-fullscreen
+    #[allow(dead_code)]
     fn action(&self, name: &str) -> Result<()> {
         self.msg(&["action", name])
-    }
-
-    /// driftwm IPC 的坐标/尺寸参数只接受整数，f64 一律四舍五入
-    fn fmt_i(v: f64) -> String {
-        format!("{}", v.round() as i64)
-    }
-
-    fn move_to(&self, id: &str, (x, y): (f64, f64)) -> Result<()> {
-        self.msg(&["move", "--id", id, &Self::fmt_i(x), &Self::fmt_i(y)])
-    }
-
-    fn resize_to(&self, id: &str, (w, h): (f64, f64)) -> Result<()> {
-        self.msg(&["resize", "--id", id, &Self::fmt_i(w), &Self::fmt_i(h)])
-    }
-
-    fn set_camera(&self, (x, y): (f64, f64)) -> Result<()> {
-        self.msg(&["camera", &Self::fmt_i(x), &Self::fmt_i(y)])
-    }
-
-    /// 聚焦窗口。实测 driftwm 的 `focus --id` 路径对部分客户端（如 emacs）
-    /// 不生效，而按 app_id 子串的路径有效，故优先用 app_id；没有 app_id 的
-    /// 窗口（如部分 XWayland 窗口）退回 --id。
-    fn focus(&self, win: &Win) -> Result<()> {
-        if win.app_id.is_empty() {
-            self.msg(&["focus", "--id", &win.key])
-        } else {
-            self.msg(&["focus", &win.app_id])
-        }
     }
 
     fn load_positions(&self) -> Positions {
@@ -248,6 +269,35 @@ impl DriftSession {
         std::fs::write(&self.positions_path, serde_json::to_string(p)?)?;
         Ok(())
     }
+
+    /// 记录/更新某窗口的 pad 状态
+    fn update_win_state(
+        &self,
+        pad: &str,
+        key: &str,
+        f: impl FnOnce(&mut PadWinState),
+    ) -> Result<()> {
+        let mut p = self.load_positions();
+        f(p.0
+            .entry(pad.to_string())
+            .or_default()
+            .entry(key.to_string())
+            .or_default());
+        self.save_positions(&p)
+    }
+
+    /// opacity 模式下处于透明隐藏状态的窗口 key 集合
+    fn opacity_hidden_keys(&self) -> BTreeMap<String, Vec<String>> {
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (pad, wins) in self.load_positions().0 {
+            for (key, st) in wins {
+                if st.opacity_hidden {
+                    out.entry(pad.clone()).or_default().push(key);
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Backend for DriftSession {
@@ -257,16 +307,26 @@ impl Backend for DriftSession {
 
     fn snapshot(&mut self) -> Result<Vec<Win>> {
         let st = self.fetch_state()?;
+        let opacity_hidden = if self.hide_mode == HideMode::Opacity {
+            self.opacity_hidden_keys()
+        } else {
+            BTreeMap::new()
+        };
         Ok(st
             .windows
             .iter()
+            // 挂件（OSD 等）与挂起占位窗口不属于任何 pad
+            .filter(|w| !w.is_widget && !w.suspended)
             .map(|w| {
                 let pos = xy(&w.position);
+                let opacity_hidden = opacity_hidden
+                    .values()
+                    .any(|keys| keys.iter().any(|k| k == &w.id.to_string()));
                 Win {
                     key: w.id.to_string(),
                     app_id: w.app_id.clone(),
                     title: w.title.clone(),
-                    hidden: in_hide_spot(pos),
+                    hidden: in_hide_spot(pos) || opacity_hidden,
                     focused: w.is_focused,
                     position: Some(pos),
                 }
@@ -275,18 +335,19 @@ impl Backend for DriftSession {
     }
 
     fn hide(&mut self, pad: &Pad, win: &Win) -> Result<()> {
-        // 已在藏匿点的窗口跳过：重复 hide 会把真实位置记录覆盖成藏匿点
+        // 已隐藏的窗口跳过：重复 hide 会把真实位置记录覆盖成藏匿点
         if win.hidden {
             return Ok(());
         }
-        // 记录当前位置，show 时移回
-        if let Some((x, y)) = win.position {
-            let mut p = self.load_positions();
-            p.0.entry(pad.name.clone())
-                .or_default()
-                .insert(win.key.clone(), (x, y));
-            self.save_positions(&p)?;
+        if self.hide_mode == HideMode::Opacity {
+            self.update_win_state(&pad.name, &win.key, |s| s.opacity_hidden = true)?;
+            return self.set_opacity(&win.key, 0);
         }
+        // move 模式：先记录当前位置，show 时移回
+        self.update_win_state(&pad.name, &win.key, |s| {
+            s.pos = win.position;
+            s.opacity_hidden = false;
+        })?;
         if let Err(e) = self.move_to(&win.key, HIDE_SPOT) {
             // 全屏窗口不能直接移动；state 不反映全屏状态，
             // 只能从 move 的报错识别，退全屏后重试
@@ -302,14 +363,30 @@ impl Backend for DriftSession {
     }
 
     fn reveal(&mut self, pad: &Pad, win: &Win, focus: bool) -> Result<(f64, f64)> {
-        let p = self.load_positions();
-        let saved = p
+        let st = self.fetch_state()?;
+        let cam = xy(&st.camera);
+
+        if self.hide_mode == HideMode::Opacity {
+            // 原地恢复不透明，窗口位置不变
+            self.update_win_state(&pad.name, &win.key, |s| s.opacity_hidden = false)?;
+            self.set_opacity(&win.key, 1)?;
+            if focus {
+                self.focus_keep_camera(win, cam)?;
+            }
+            return Ok(xy(&st
+                .windows
+                .iter()
+                .find(|w| w.id.to_string() == win.key)
+                .map(|w| w.position.clone())
+                .unwrap_or_default()));
+        }
+
+        let saved = self
+            .load_positions()
             .0
             .get(&pad.name)
             .and_then(|m| m.get(&win.key))
             .copied();
-        let st = self.fetch_state()?;
-        let cam = xy(&st.camera);
         let geo = pad.has_geometry();
 
         if pad.spec.fullscreen {
@@ -330,17 +407,21 @@ impl Backend for DriftSession {
         let want_resize = pad.spec.width.is_some() || pad.spec.height.is_some();
         let (w_px, h_px) = if geo {
             let z = st.zoom.max(0.1);
-            (
-                pad.spec.width.map_or(cur_size.0 * z, |v| v as f64),
-                pad.spec.height.map_or(cur_size.1 * z, |v| v as f64),
-            )
+            let w = match &pad.spec.width {
+                Some(sz) => sz.resolve_px(self.viewport.0)?,
+                None => cur_size.0 * z,
+            };
+            let h = match &pad.spec.height {
+                Some(sz) => sz.resolve_px(self.viewport.1)?,
+                None => cur_size.1 * z,
+            };
+            (w, h)
         } else {
             (0.0, 0.0)
         };
 
         // 目标位置：配置了几何且尺寸可算则按停靠边计算，否则回隐藏前位置
-        let use_edge = geo && w_px > 0.0 && h_px > 0.0;
-        let target = if use_edge {
+        let target = if geo && w_px > 0.0 && h_px > 0.0 {
             edge_position(
                 pad.spec.edge.unwrap_or(Edge::Top),
                 pad.spec.margin as f64,
@@ -351,7 +432,7 @@ impl Backend for DriftSession {
                 self.viewport,
             )
         } else {
-            match saved {
+            match saved.and_then(|s| s.pos) {
                 Some(pos) if in_viewport(pos, cam, st.zoom, self.viewport) => pos,
                 // 没有隐藏记录，或恢复位置在当前视野之外：带到当前视野中心
                 _ => cam,
@@ -370,6 +451,16 @@ impl Backend for DriftSession {
         Ok(target)
     }
 
+    fn close(&mut self, win: &Win) -> Result<()> {
+        // 顺手清掉该窗口的 pad 记录
+        let mut p = self.load_positions();
+        for wins in p.0.values_mut() {
+            wins.remove(&win.key);
+        }
+        self.save_positions(&p)?;
+        self.msg(&["close", "--id", &win.key])
+    }
+
     fn sync(&mut self) -> Result<()> {
         Ok(())
     }
@@ -378,11 +469,7 @@ impl Backend for DriftSession {
         let deadline = Instant::now() + timeout;
         loop {
             let st = self.fetch_state()?;
-            if let Some(w) = st
-                .windows
-                .iter()
-                .find(|w| pad.matches(&w.app_id, &w.title))
-            {
+            if let Some(w) = st.windows.iter().find(|w| pad.matches(&w.app_id, &w.title)) {
                 let win = Win {
                     key: w.id.to_string(),
                     app_id: w.app_id.clone(),
@@ -408,8 +495,7 @@ impl Backend for DriftSession {
                     prev = pos;
                 }
                 let target = self.reveal(pad, &win, pad.spec.focus_on_show)?;
-                // driftwm 对新窗口的初始放置动画可能覆盖定位，
-                // 校验窗口是否停在目标位置，最多重试几轮
+                // 兜底校验：位置若仍被覆盖则再定位一次
                 for _ in 0..3 {
                     std::thread::sleep(PLACEMENT_SETTLE);
                     let st = self.fetch_state()?;
@@ -420,8 +506,7 @@ impl Backend for DriftSession {
                         .map(|w| xy(&w.position));
                     match pos {
                         Some(p)
-                            if (p.0 - target.0).abs() <= 5.0
-                                && (p.1 - target.1).abs() <= 5.0 =>
+                            if (p.0 - target.0).abs() <= 5.0 && (p.1 - target.1).abs() <= 5.0 =>
                         {
                             break;
                         }

@@ -433,6 +433,7 @@ dependencies = [
  "anyhow",
  "clap",
  "indexmap",
+ "libc",
  "regex",
  "serde",
  "serde_json",

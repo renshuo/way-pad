@@ -73,7 +73,10 @@ impl Session {
 
         Ok(Session {
             queue,
-            state: SessionState { toplevels: Vec::new(), seat },
+            state: SessionState {
+                toplevels: Vec::new(),
+                seat,
+            },
             manager,
         })
     }
@@ -86,8 +89,8 @@ impl Session {
     pub fn collect(&mut self) -> Result<()> {
         for _ in 0..10 {
             self.queue.roundtrip(&mut self.state)?;
-            let settled = !self.state.toplevels.is_empty()
-                && self.state.toplevels.iter().all(|t| t.done);
+            let settled =
+                !self.state.toplevels.is_empty() && self.state.toplevels.iter().all(|t| t.done);
             if settled {
                 return Ok(());
             }
@@ -181,13 +184,21 @@ impl Backend for Session {
         Ok((0.0, 0.0))
     }
 
+    fn close(&mut self, win: &Win) -> Result<()> {
+        if let Some(t) = self.find_by_key(&win.key) {
+            t.handle.close();
+        }
+        self.flush()
+    }
+
     fn sync(&mut self) -> Result<()> {
         self.flush()
     }
 
     fn wait_for(&mut self, pad: &Pad, timeout: Duration) -> Result<bool> {
         let found = self.wait_until(timeout, |ts| {
-            ts.iter().any(|t| !t.closed && pad.matches(&t.app_id, &t.title))
+            ts.iter()
+                .any(|t| !t.closed && pad.matches(&t.app_id, &t.title))
         })?;
         if !found {
             return Ok(false);

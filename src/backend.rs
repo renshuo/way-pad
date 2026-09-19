@@ -37,6 +37,9 @@ pub trait Backend {
     /// 把 hide/reveal 已发出的请求冲到合成器
     fn sync(&mut self) -> Result<()>;
 
+    /// 关闭窗口
+    fn close(&mut self, win: &Win) -> Result<()>;
+
     /// 启动命令后等待匹配 pad 的窗口出现；找到即显示并聚焦，返回 true
     fn wait_for(&mut self, pad: &Pad, timeout: Duration) -> Result<bool>;
 

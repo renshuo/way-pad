@@ -50,11 +50,11 @@ fn launch_and_wait(backend: &mut dyn Backend, pad: &Pad, wait: Duration) -> Resu
     if backend.wait_for(pad, wait)? {
         Ok(format!("已启动并显示 '{}'", pad.name))
     } else {
-        Ok(format!(
+        bail!(
             "已启动 '{}'，但 {}ms 内未出现匹配窗口",
             pad.name,
             wait.as_millis()
-        ))
+        );
     }
 }
 
@@ -114,6 +114,17 @@ pub fn hide(backend: &mut dyn Backend, pad: &Pad) -> Result<String> {
     }
     backend.sync()?;
     Ok(format!("已隐藏 '{}'（{} 个窗口）", pad.name, wins.len()))
+}
+
+pub fn close(backend: &mut dyn Backend, pad: &Pad) -> Result<String> {
+    let wins = matching_twice(backend, pad)?;
+    if wins.is_empty() {
+        return Ok(format!("'{}' 没有匹配的窗口", pad.name));
+    }
+    for w in &wins {
+        backend.close(w)?;
+    }
+    Ok(format!("已关闭 '{}'（{} 个窗口）", pad.name, wins.len()))
 }
 
 pub fn list(backend: &mut dyn Backend, pads: &[Pad]) -> Result<String> {
@@ -178,5 +189,147 @@ pub fn list(backend: &mut dyn Backend, pads: &[Pad]) -> Result<String> {
             matched,
         ));
     }
+    Ok(out)
+}
+
+// ---- list --json ----
+
+#[derive(serde::Serialize)]
+struct PadJson {
+    name: String,
+    app_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch: Option<String>,
+    matched_windows: usize,
+}
+
+#[derive(serde::Serialize)]
+struct WinJson {
+    key: String,
+    app_id: String,
+    title: String,
+    hidden: bool,
+    focused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position: Option<(f64, f64)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_pad: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ListJson {
+    backend: String,
+    pads: Vec<PadJson>,
+    windows: Vec<WinJson>,
+}
+
+pub fn list_json(backend: &mut dyn Backend, pads: &[Pad]) -> Result<String> {
+    let wins = backend.snapshot()?;
+    let list = ListJson {
+        backend: backend.backend_name().to_string(),
+        pads: pads
+            .iter()
+            .map(|p| PadJson {
+                name: p.name.clone(),
+                app_id: p.spec.app_id.clone(),
+                title: (!p.spec.title.is_empty()).then(|| p.spec.title.clone()),
+                launch: p.spec.launch.clone(),
+                matched_windows: wins
+                    .iter()
+                    .filter(|w| p.matches(&w.app_id, &w.title))
+                    .count(),
+            })
+            .collect(),
+        windows: wins
+            .iter()
+            .map(|w| WinJson {
+                key: w.key.clone(),
+                app_id: w.app_id.clone(),
+                title: w.title.clone(),
+                hidden: w.hidden,
+                focused: w.focused,
+                position: w.position,
+                matched_pad: pads
+                    .iter()
+                    .find(|p| p.matches(&w.app_id, &w.title))
+                    .map(|p| p.name.clone()),
+            })
+            .collect(),
+    };
+    serde_json::to_string_pretty(&list).context("序列化 list 输出失败")
+}
+
+/// `doctor`：诊断配置、后端与各 pad 的匹配情况
+pub fn doctor(backend: &mut dyn Backend, pads: &[Pad], config_path: &str) -> Result<String> {
+    let wins = backend.snapshot()?;
+    let mut out = String::new();
+
+    out.push_str(&format!("配置文件: {config_path}\n"));
+    out.push_str(&format!(
+        "后端: {}\n窗口总数: {}\n\n",
+        backend.backend_name(),
+        wins.len()
+    ));
+
+    out.push_str("Pads:\n");
+    for p in pads {
+        let n = wins
+            .iter()
+            .filter(|w| p.matches(&w.app_id, &w.title))
+            .count();
+        let geo = if p.spec.fullscreen {
+            "fullscreen".to_string()
+        } else {
+            let mut parts = Vec::new();
+            if let Some(w) = &p.spec.width {
+                parts.push(format!("width={w:?}"));
+            }
+            if let Some(h) = &p.spec.height {
+                parts.push(format!("height={h:?}"));
+            }
+            if let Some(e) = p.spec.edge {
+                parts.push(format!("edge={e:?}"));
+            }
+            if p.spec.margin != 0 {
+                parts.push(format!("margin={}", p.spec.margin));
+            }
+            if parts.is_empty() {
+                "无".to_string()
+            } else {
+                parts.join(" ")
+            }
+        };
+        out.push_str(&format!(
+            "  {:<14} 匹配窗口: {}  launch: {}  几何: {}\n",
+            p.name,
+            n,
+            p.spec.launch.as_deref().unwrap_or("（未配置）"),
+            geo,
+        ));
+        if n == 0 {
+            match p.spec.launch.as_deref() {
+                Some(cmd) => out.push_str(&format!(
+                    "                 （无匹配窗口；按键时将启动: {cmd}）\n"
+                )),
+                None => {
+                    out.push_str("                 （无匹配窗口；未配置 launch，按键时将报错）\n")
+                }
+            }
+        }
+    }
+
+    let mut hidden = 0;
+    let mut focused = 0;
+    for w in &wins {
+        if w.hidden {
+            hidden += 1;
+        }
+        if w.focused {
+            focused += 1;
+        }
+    }
+    out.push_str(&format!("\n状态: {hidden} 个隐藏，{focused} 个聚焦\n"));
     Ok(out)
 }

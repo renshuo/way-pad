@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 const DEFAULT_LAUNCH_WAIT_MS: u64 = 1500;
 
-/// 隐藏窗口的实现方式
+/// 隐藏窗口的后端
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
@@ -23,17 +23,71 @@ pub enum BackendKind {
     Driftwm,
 }
 
+/// 隐藏方式（仅 driftwm 后端支持 opacity）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HideMode {
+    /// 移到画布极远的藏匿点（默认）
+    #[default]
+    Move,
+    /// 窗口原地全透明。注意：透明窗口通常仍会拦截鼠标点击
+    Opacity,
+}
+
+/// 窗口停靠边（相对当前视野）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Edge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Center,
+}
+
+/// 窗口尺寸：像素或视口百分比（如 "90%"）
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum Size {
+    Px(u32),
+    Percent(String),
+}
+
+impl Size {
+    /// 换算成屏幕像素。`viewport_side` 为对应的视口宽/高
+    pub fn resolve_px(&self, viewport_side: f64) -> Result<f64> {
+        match self {
+            Size::Px(v) => Ok(*v as f64),
+            Size::Percent(s) => {
+                let p: f64 = s
+                    .strip_suffix('%')
+                    .context(format!("百分比尺寸格式错误: {s:?}（示例 \"90%\"）"))?
+                    .trim()
+                    .parse()
+                    .context(format!("百分比尺寸格式错误: {s:?}（示例 \"90%\"）"))?;
+                if !(0.0..=100.0).contains(&p) {
+                    bail!("百分比尺寸超出 0-100%: {s:?}");
+                }
+                Ok(p / 100.0 * viewport_side)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// 隐藏窗口的后端
     #[serde(default)]
     pub backend: BackendKind,
+    /// 隐藏方式（仅 driftwm 后端支持 opacity）
+    #[serde(default)]
+    pub hide_mode: HideMode,
     /// driftwm 后端判断"窗口是否在当前视野内"所用的视口尺寸（物理像素），
     /// 通常设为显示器分辨率
     #[serde(default)]
     pub viewport: Option<(f64, f64)>,
-    /// `launch` 启动后等待匹配窗口出现的毫秒数
+    /// `launch` 启动后等待匹配窗口出现的默认毫秒数（可被 pad 级覆盖）
     #[serde(default = "default_launch_wait_ms")]
     pub launch_wait_ms: u64,
     /// pad 名字 -> pad 定义；保留书写顺序
@@ -59,19 +113,22 @@ pub struct PadSpec {
     /// 显示窗口时是否同时聚焦（默认 true）
     #[serde(default = "default_true")]
     pub focus_on_show: bool,
-    /// 显示时窗口宽度（屏幕像素）；省略则保持窗口当前宽度
+    /// 该 pad 启动命令后等待窗口出现的毫秒数；省略则用顶层值
     #[serde(default)]
-    pub width: Option<u32>,
-    /// 显示时窗口高度（屏幕像素）；省略则保持窗口当前高度
+    pub launch_wait_ms: Option<u64>,
+    /// 显示时窗口宽度（屏幕像素，或视口百分比如 "90%"）；省略则保持当前宽度
     #[serde(default)]
-    pub height: Option<u32>,
+    pub width: Option<Size>,
+    /// 显示时窗口高度（同上）
+    #[serde(default)]
+    pub height: Option<Size>,
     /// 窗口距视野边缘的边距（屏幕像素），默认 0
     #[serde(default)]
     pub margin: u32,
     /// 窗口停靠边：top/bottom/left/right/center（默认 top）
     #[serde(default)]
     pub edge: Option<Edge>,
-    /// 显示时进入全屏；true 时忽略 width/height/edge/margin（默认 false）
+    /// 显示时占满当前视野；true 时忽略 width/height/edge/margin（默认 false）
     #[serde(default)]
     pub fullscreen: bool,
 }
@@ -83,6 +140,7 @@ impl Default for PadSpec {
             title: String::new(),
             launch: None,
             focus_on_show: true,
+            launch_wait_ms: None,
             width: None,
             height: None,
             margin: 0,
@@ -96,17 +154,6 @@ fn default_true() -> bool {
     true
 }
 
-/// 窗口停靠边（相对当前视野）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Edge {
-    Top,
-    Bottom,
-    Left,
-    Right,
-    Center,
-}
-
 /// 编译好正则、可直接使用的 pad
 #[derive(Debug)]
 pub struct Pad {
@@ -118,15 +165,18 @@ pub struct Pad {
 
 impl Pad {
     pub fn matches(&self, app_id: &str, title: &str) -> bool {
-        self.app_id.is_match(app_id)
-            && self.title.as_ref().is_none_or(|r| r.is_match(title))
+        self.app_id.is_match(app_id) && self.title.as_ref().is_none_or(|r| r.is_match(title))
     }
 
     /// 是否配置了窗口几何（width/height/edge/margin/fullscreen 任一）
     pub fn has_geometry(&self) -> bool {
         let s = &self.spec;
-        s.fullscreen || s.width.is_some() || s.height.is_some() || s.margin != 0
-            || s.edge.is_some()
+        s.fullscreen || s.width.is_some() || s.height.is_some() || s.margin != 0 || s.edge.is_some()
+    }
+
+    /// 该 pad 生效的 launch 等待时间（pad 级覆盖顶层）
+    pub fn launch_wait_ms(&self, global: u64) -> u64 {
+        self.spec.launch_wait_ms.unwrap_or(global)
     }
 }
 
@@ -173,18 +223,18 @@ impl Config {
                     bail!("pad '{name}' 的 title 不是合法正则表达式: {e}");
                 }
             }
+            if let Some(Size::Percent(s)) = &spec.width {
+                Size::Percent(s.clone()).resolve_px(1920.0)?;
+            }
+            if let Some(Size::Percent(s)) = &spec.height {
+                Size::Percent(s.clone()).resolve_px(1080.0)?;
+            }
         }
         Ok(())
     }
 
     fn pad(&self, name: &str) -> Result<Pad> {
-        let names = || {
-            self.pads
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        let names = || self.pads.keys().cloned().collect::<Vec<_>>().join(", ");
         let spec = self
             .pads
             .get(name)
@@ -248,6 +298,7 @@ focus_on_show = false
 "#,
         );
         assert_eq!(cfg.launch_wait_ms, DEFAULT_LAUNCH_WAIT_MS);
+        assert_eq!(cfg.hide_mode, HideMode::Move);
         let term = cfg.resolve(Some("term")).unwrap();
         assert!(term.spec.focus_on_show);
         assert!(term.matches("foot", "任意标题"));
@@ -306,5 +357,75 @@ focus_on_show = false
         assert!(d.launch.is_none());
         assert!(d.focus_on_show);
         assert_eq!(indexmap::IndexMap::<String, PadSpec>::new().len(), 0);
+    }
+
+    #[test]
+    fn parses_hide_mode_and_sizes() {
+        let cfg = parse(
+            r#"
+hide_mode = "opacity"
+
+[pads.a]
+app_id = 'x'
+width = 1600
+height = "90%"
+"#,
+        );
+        assert_eq!(cfg.hide_mode, HideMode::Opacity);
+        let p = cfg.resolve(Some("a")).unwrap();
+        assert!(matches!(p.spec.width, Some(Size::Px(1600))));
+        assert_eq!(
+            p.spec.height.as_ref().unwrap().resolve_px(1080.0).unwrap(),
+            972.0
+        );
+    }
+
+    #[test]
+    fn rejects_bad_percent() {
+        let cfg: Config = toml::from_str("[pads.a]\napp_id='x'\nheight = \"120%\"\n").unwrap();
+        assert!(cfg.validate().is_err());
+        let cfg: Config = toml::from_str("[pads.a]\napp_id='x'\nheight = \"abc%\"\n").unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn pad_level_wait_overrides_global() {
+        let cfg = parse(
+            r#"
+launch_wait_ms = 1500
+
+[pads.slow]
+app_id = 'x'
+launch_wait_ms = 9000
+
+[pads.fast]
+app_id = 'y'
+"#,
+        );
+        let slow = cfg.resolve(Some("slow")).unwrap();
+        let fast = cfg.resolve(Some("fast")).unwrap();
+        assert_eq!(slow.launch_wait_ms(cfg.launch_wait_ms), 9000);
+        assert_eq!(fast.launch_wait_ms(cfg.launch_wait_ms), 1500);
+    }
+
+    #[test]
+    fn has_geometry_variants() {
+        let cfg = parse(
+            r#"
+[pads.a]
+app_id = 'x'
+margin = 5
+
+[pads.b]
+app_id = 'y'
+fullscreen = true
+
+[pads.c]
+app_id = 'z'
+"#,
+        );
+        assert!(cfg.resolve(Some("a")).unwrap().has_geometry());
+        assert!(cfg.resolve(Some("b")).unwrap().has_geometry());
+        assert!(!cfg.resolve(Some("c")).unwrap().has_geometry());
     }
 }
