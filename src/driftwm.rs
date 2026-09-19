@@ -441,19 +441,11 @@ impl Backend for DriftSession {
         let st = self.fetch_state()?;
         let cam = xy(&st.camera);
 
+        // opacity：原地恢复不透明。窗口可能不在当前视野内（隐藏期间用户
+        // 平移了视野）——随后统一走视野内定位，保证按快捷键后总能看到它
         if mode == HideMode::Opacity {
-            // 原地恢复不透明，窗口位置不变
             self.update_win_state(&pad.name, &win.key, |s| s.opacity_hidden = false)?;
             self.set_opacity(&win.key, 1)?;
-            if focus {
-                self.focus_keep_camera(win, cam)?;
-            }
-            return Ok(xy(&st
-                .windows
-                .iter()
-                .find(|w| w.id.to_string() == win.key)
-                .map(|w| w.position.clone())
-                .unwrap_or_default()));
         }
 
         let saved = self
