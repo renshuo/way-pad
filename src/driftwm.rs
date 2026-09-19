@@ -270,6 +270,13 @@ impl DriftSession {
         Ok(())
     }
 
+    /// WAY_PAD_DEBUG=1 时输出定位过程日志
+    fn debug_log(&self, msg: &str) {
+        if std::env::var("WAY_PAD_DEBUG").is_ok_and(|v| !v.is_empty()) {
+            eprintln!("way-pad debug: {msg}");
+        }
+    }
+
     /// 记录/更新某窗口的 pad 状态
     fn update_win_state(
         &self,
@@ -439,15 +446,25 @@ impl Backend for DriftSession {
             }
         };
 
-        self.move_to(&win.key, target)?;
+        // 悬浮定位（driftwm 专有，避免视图跳跃）：
+        // focus 会把相机动画平移到窗口居中位，若窗口先落到贴边/停靠位，
+        // 聚焦时视野会往返晃动。因此分两步——
+        // 1) 窗口先到当前视野中心，与 focus 的居中目标对齐（相机动画≈0）；
+        self.debug_log(&format!(
+            "reveal '{}': cam={cam:?} target={target:?} size=({w_px},{h_px}) resize={want_resize} focus={focus}",
+            pad.name
+        ));
+        self.move_to(&win.key, cam)?;
         // driftwm 的 resize 保持窗口中心不变，与 move 互不影响
         if want_resize && cur.is_some() {
             let z = st.zoom.max(0.1);
             self.resize_to(&win.key, (w_px / z, h_px / z))?;
         }
+        // 2) 聚焦（视野稳定），随后窗口瞬移到最终停靠位——move 不影响相机
         if focus {
             self.focus_keep_camera(win, cam)?;
         }
+        self.move_to(&win.key, target)?;
         Ok(target)
     }
 
