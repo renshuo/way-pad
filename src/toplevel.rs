@@ -169,7 +169,7 @@ impl Backend for Session {
         Ok(())
     }
 
-    fn reveal(&mut self, _pad: &Pad, win: &Win, focus: bool) -> Result<()> {
+    fn reveal(&mut self, _pad: &Pad, win: &Win, focus: bool) -> Result<(f64, f64)> {
         if let Some(t) = self.find_by_key(&win.key) {
             t.handle.unset_minimized();
             if focus {
@@ -178,7 +178,7 @@ impl Backend for Session {
                 }
             }
         }
-        Ok(())
+        Ok((0.0, 0.0))
     }
 
     fn sync(&mut self) -> Result<()> {

@@ -30,8 +30,9 @@ pub trait Backend {
     /// 隐藏单个窗口
     fn hide(&mut self, pad: &Pad, win: &Win) -> Result<()>;
 
-    /// 显示单个窗口；focus 时同时请求聚焦
-    fn reveal(&mut self, pad: &Pad, win: &Win, focus: bool) -> Result<()>;
+    /// 显示单个窗口；focus 时同时请求聚焦。
+    /// 返回窗口最终应处的位置（driftwm 后端用于 launch 后校验定位）
+    fn reveal(&mut self, pad: &Pad, win: &Win, focus: bool) -> Result<(f64, f64)>;
 
     /// 把 hide/reveal 已发出的请求冲到合成器
     fn sync(&mut self) -> Result<()>;

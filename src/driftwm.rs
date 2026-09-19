@@ -21,8 +21,10 @@ const HIDE_SPOT: (f64, f64) = (100_000_000.0, 100_000_000.0);
 const HIDE_SPOT_TOLERANCE: f64 = 5000.0;
 /// launch 后轮询窗口出现的间隔
 const POLL_INTERVAL: Duration = Duration::from_millis(120);
-/// 新窗口出现后等待 driftwm 完成 auto placement 的时间
-const PLACEMENT_SETTLE: Duration = Duration::from_millis(250);
+/// 新窗口出现后的采样间隔，用于等待 driftwm 初始放置收敛
+const PLACEMENT_SETTLE: Duration = Duration::from_millis(150);
+/// driftwm focus 相机平移动画的时长
+const FOCUS_CAMERA_ANIMATION: Duration = Duration::from_millis(320);
 
 pub struct DriftSession {
     positions_path: PathBuf,
@@ -182,6 +184,23 @@ impl DriftSession {
         Ok(())
     }
 
+    /// 聚焦窗口。driftwm 的 focus 会把视口平移到聚焦窗口（居中），
+    /// 破坏 edge/贴边定位。相机平移是约 300ms 的动画，动画期间 camera
+    /// 返回中间帧——等动画结束再校验，若相机被拖离则移回 focus 前位置
+    fn focus_keep_camera(&self, win: &Win, cam: (f64, f64)) -> Result<()> {
+        self.focus(win)?;
+        std::thread::sleep(FOCUS_CAMERA_ANIMATION);
+        for _ in 0..3 {
+            let cam_now = xy(&self.fetch_state()?.camera);
+            if (cam_now.0 - cam.0).abs() <= 1.0 && (cam_now.1 - cam.1).abs() <= 1.0 {
+                return Ok(());
+            }
+            self.set_camera(cam)?;
+            std::thread::sleep(Duration::from_millis(120));
+        }
+        Ok(())
+    }
+
     /// 运行一个配置动作（作用于聚焦窗口），如 toggle-fullscreen
     fn action(&self, name: &str) -> Result<()> {
         self.msg(&["action", name])
@@ -198,6 +217,10 @@ impl DriftSession {
 
     fn resize_to(&self, id: &str, (w, h): (f64, f64)) -> Result<()> {
         self.msg(&["resize", "--id", id, &Self::fmt_i(w), &Self::fmt_i(h)])
+    }
+
+    fn set_camera(&self, (x, y): (f64, f64)) -> Result<()> {
+        self.msg(&["camera", &Self::fmt_i(x), &Self::fmt_i(y)])
     }
 
     /// 聚焦窗口。实测 driftwm 的 `focus --id` 路径对部分客户端（如 emacs）
@@ -270,14 +293,15 @@ impl Backend for DriftSession {
             if !format!("{e:#}").contains("fullscreen") {
                 return Err(e);
             }
-            self.focus(win)?;
+            let cam0 = xy(&self.fetch_state()?.camera);
+            self.focus_keep_camera(win, cam0)?;
             self.action("toggle-fullscreen")?;
             self.move_to(&win.key, HIDE_SPOT)?;
         }
         Ok(())
     }
 
-    fn reveal(&mut self, pad: &Pad, win: &Win, focus: bool) -> Result<()> {
+    fn reveal(&mut self, pad: &Pad, win: &Win, focus: bool) -> Result<(f64, f64)> {
         let p = self.load_positions();
         let saved = p
             .0
@@ -295,9 +319,9 @@ impl Backend for DriftSession {
             self.move_to(&win.key, cam)?;
             self.resize_to(&win.key, (self.viewport.0 / z, self.viewport.1 / z))?;
             if focus {
-                self.focus(win)?;
+                self.focus_keep_camera(win, cam)?;
             }
-            return Ok(());
+            return Ok(cam);
         }
 
         // 目标尺寸（屏幕像素）：配置值优先，否则保持当前尺寸
@@ -315,7 +339,8 @@ impl Backend for DriftSession {
         };
 
         // 目标位置：配置了几何且尺寸可算则按停靠边计算，否则回隐藏前位置
-        let target = if geo && w_px > 0.0 && h_px > 0.0 {
+        let use_edge = geo && w_px > 0.0 && h_px > 0.0;
+        let target = if use_edge {
             edge_position(
                 pad.spec.edge.unwrap_or(Edge::Top),
                 pad.spec.margin as f64,
@@ -340,9 +365,9 @@ impl Backend for DriftSession {
             self.resize_to(&win.key, (w_px / z, h_px / z))?;
         }
         if focus {
-            self.focus(win)?;
+            self.focus_keep_camera(win, cam)?;
         }
-        Ok(())
+        Ok(target)
     }
 
     fn sync(&mut self) -> Result<()> {
@@ -366,10 +391,45 @@ impl Backend for DriftSession {
                     focused: false,
                     position: Some(xy(&w.position)),
                 };
-                // 窗口刚出现时 driftwm 的 auto placement 可能还没完成，
-                // 稍等再定位，避免与放置逻辑竞态；几何/聚焦统一走 reveal
-                std::thread::sleep(PLACEMENT_SETTLE);
-                self.reveal(pad, &win, pad.spec.focus_on_show)?;
+                // 窗口刚出现时 driftwm 的初始放置动画会覆盖后续定位，
+                // 先等位置收敛（连续两次采样不变），再应用几何
+                let mut prev: Option<(f64, f64)> = None;
+                for _ in 0..12 {
+                    std::thread::sleep(PLACEMENT_SETTLE);
+                    let st = self.fetch_state()?;
+                    let pos = st
+                        .windows
+                        .iter()
+                        .find(|w| w.id.to_string() == win.key)
+                        .map(|w| xy(&w.position));
+                    if pos.is_some() && pos == prev {
+                        break;
+                    }
+                    prev = pos;
+                }
+                let target = self.reveal(pad, &win, pad.spec.focus_on_show)?;
+                // driftwm 对新窗口的初始放置动画可能覆盖定位，
+                // 校验窗口是否停在目标位置，最多重试几轮
+                for _ in 0..3 {
+                    std::thread::sleep(PLACEMENT_SETTLE);
+                    let st = self.fetch_state()?;
+                    let pos = st
+                        .windows
+                        .iter()
+                        .find(|w| w.id.to_string() == win.key)
+                        .map(|w| xy(&w.position));
+                    match pos {
+                        Some(p)
+                            if (p.0 - target.0).abs() <= 5.0
+                                && (p.1 - target.1).abs() <= 5.0 =>
+                        {
+                            break;
+                        }
+                        _ => {
+                            self.reveal(pad, &win, false)?;
+                        }
+                    }
+                }
                 return Ok(true);
             }
             if Instant::now() >= deadline {
