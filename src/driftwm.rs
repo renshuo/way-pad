@@ -293,6 +293,45 @@ impl DriftSession {
         self.save_positions(&p)
     }
 
+    /// suspend 模式：确保 pad 的 .desktop 条目存在（relaunch 依赖它启动
+    /// 带正确参数的应用，使窗口 app_id 在挂起/恢复间保持一致）
+    fn ensure_desktop(&self, pad: &Pad) -> Result<()> {
+        let Some(launch) = pad.spec.launch.as_deref() else {
+            bail!(
+                "pad '{}' 使用 suspend 隐藏模式必须配置 launch 命令",
+                pad.name
+            );
+        };
+        let Some(class) = pad.spec.literal_app_id() else {
+            bail!(
+                "pad '{}' 使用 suspend 隐藏模式需要字面 app_id（或显式配置 wm_class）",
+                pad.name
+            );
+        };
+        let dir = match std::env::var("XDG_DATA_HOME") {
+            Ok(v) if !v.is_empty() => PathBuf::from(v),
+            _ => PathBuf::from(std::env::var("HOME").context("无法定位应用目录：HOME 未设置")?)
+                .join(".local/share"),
+        }
+        .join("applications");
+        std::fs::create_dir_all(&dir)?;
+        // launch 经 sh -c 执行以保持与其它模式相同的 shell 语义
+        let quoted = format!("\"{}\"", launch.replace('\\', "\\\\").replace('"', "\\\""));
+        let content = format!(
+            "[Desktop Entry]\nType=Application\nName=way-pad {}\nExec=sh -c {}\nStartupWMClass={}\nTerminal=false\nNoDisplay=true\n",
+            pad.name, quoted, class
+        );
+        let path = dir.join(pad.spec.desktop_file_name(&pad.name).expect("class 已确认"));
+        let stale = std::fs::read_to_string(&path)
+            .map(|old| old != content)
+            .unwrap_or(true);
+        if stale {
+            std::fs::write(&path, content)
+                .with_context(|| format!("写入 {} 失败", path.display()))?;
+        }
+        Ok(())
+    }
+
     /// opacity 模式下处于透明隐藏状态的窗口 key 集合
     fn opacity_hidden_keys(&self) -> BTreeMap<String, Vec<String>> {
         let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -322,8 +361,8 @@ impl Backend for DriftSession {
         Ok(st
             .windows
             .iter()
-            // 挂件（OSD 等）与挂起占位窗口不属于任何 pad
-            .filter(|w| !w.is_widget && !w.suspended)
+            // 挂件（OSD 等）不属于任何 pad；挂起占位窗口保留并视为已隐藏
+            .filter(|w| !w.is_widget)
             .map(|w| {
                 let pos = xy(&w.position);
                 let opacity_hidden = opacity_hidden
@@ -333,7 +372,7 @@ impl Backend for DriftSession {
                     key: w.id.to_string(),
                     app_id: w.app_id.clone(),
                     title: w.title.clone(),
-                    hidden: in_hide_spot(pos) || opacity_hidden,
+                    hidden: in_hide_spot(pos) || opacity_hidden || w.suspended,
                     focused: w.is_focused,
                     position: Some(pos),
                 }
@@ -346,7 +385,12 @@ impl Backend for DriftSession {
         if win.hidden {
             return Ok(());
         }
-        if self.hide_mode == HideMode::Opacity {
+        let mode = pad.spec.hide_mode.unwrap_or(self.hide_mode);
+        if mode == HideMode::Suspend {
+            self.ensure_desktop(pad)?;
+            return self.msg(&["suspend", "--id", &win.key]);
+        }
+        if mode == HideMode::Opacity {
             self.update_win_state(&pad.name, &win.key, |s| s.opacity_hidden = true)?;
             return self.set_opacity(&win.key, 0);
         }
@@ -370,10 +414,34 @@ impl Backend for DriftSession {
     }
 
     fn reveal(&mut self, pad: &Pad, win: &Win, focus: bool) -> Result<(f64, f64)> {
+        let mode = pad.spec.hide_mode.unwrap_or(self.hide_mode);
+        if mode == HideMode::Suspend {
+            // 挂起窗口走 relaunch：driftwm 依据 .desktop 重启应用，
+            // 并把新窗口收养进 stand-in 槽位（id/app_id 保持）
+            self.msg(&["relaunch", &win.app_id])?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                std::thread::sleep(POLL_INTERVAL);
+                let st = self.fetch_state()?;
+                if let Some(w) = st.windows.iter().find(|w| w.id.to_string() == win.key) {
+                    if !w.suspended {
+                        self.debug_log("suspend 窗口已收养复活");
+                        break;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "relaunch '{}' 后窗口未在期限内恢复（检查 .desktop 是否匹配）",
+                        win.app_id
+                    );
+                }
+            }
+        }
+
         let st = self.fetch_state()?;
         let cam = xy(&st.camera);
 
-        if self.hide_mode == HideMode::Opacity {
+        if mode == HideMode::Opacity {
             // 原地恢复不透明，窗口位置不变
             self.update_win_state(&pad.name, &win.key, |s| s.opacity_hidden = false)?;
             self.set_opacity(&win.key, 1)?;

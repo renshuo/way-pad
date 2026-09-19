@@ -23,15 +23,20 @@ pub enum BackendKind {
     Driftwm,
 }
 
-/// 隐藏方式（仅 driftwm 后端支持 opacity）
+/// 隐藏方式（仅 driftwm 后端支持 opacity/suspend）
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HideMode {
-    /// 移到画布极远的藏匿点（默认）
+    /// 移到画布极远的藏匿点（默认）。注意：藏匿窗口会被 zoom-to-fit /
+    /// home 等"适配全部窗口"的操作计入，导致视野飞向藏匿点
     #[default]
     Move,
-    /// 窗口原地全透明。注意：透明窗口通常仍会拦截鼠标点击
+    /// 窗口原地全透明（推荐）。注意：透明窗口通常仍会拦截鼠标点击
     Opacity,
+    /// driftwm 原生挂起：关闭窗口进程、原地留占位窗口；显示时经
+    /// .desktop 重新启动（way-pad 自动生成并维护对应 .desktop 条目）。
+    /// 应用会被重启——仅适合可恢复会话的应用（zellij、dolphin 等）
+    Suspend,
 }
 
 /// 窗口停靠边（相对当前视野）
@@ -131,6 +136,45 @@ pub struct PadSpec {
     /// 显示时占满当前视野；true 时忽略 width/height/edge/margin（默认 false）
     #[serde(default)]
     pub fullscreen: bool,
+    /// suspend 隐藏模式下生成 .desktop 用的窗口类名（字面 app_id）。
+    /// 省略时从 app_id 正则提取字面值；正则较复杂时必须显式配置
+    #[serde(default)]
+    pub wm_class: Option<String>,
+    /// 该 pad 的隐藏方式，覆盖顶层 hide_mode（move/opacity/suspend）
+    #[serde(default)]
+    pub hide_mode: Option<HideMode>,
+}
+
+impl PadSpec {
+    /// 从 app_id 正则提取字面 app_id（suspend 模式生成 .desktop 用）。
+    /// 仅支持去掉锚点/大小写标志后的纯字面正则；含正则元字符返回 None
+    pub fn literal_app_id(&self) -> Option<String> {
+        if let Some(w) = &self.wm_class {
+            return Some(w.clone());
+        }
+        let mut s = self.app_id.trim();
+        let mut ci = false;
+        if let Some(rest) = s.strip_prefix("(?i)") {
+            ci = true;
+            s = rest;
+        }
+        let s = s.strip_prefix('^').unwrap_or(s);
+        let s = s.strip_suffix('$').unwrap_or(s);
+        if s.is_empty() || s.chars().any(|c| "\\[](){}|.*+?^$".contains(c)) {
+            return None;
+        }
+        Some(if ci {
+            format!("(?i){s}")
+        } else {
+            s.to_string()
+        })
+    }
+
+    /// suspend 模式对应的 .desktop 文件名（不含目录）
+    pub fn desktop_file_name(&self, pad_name: &str) -> Option<String> {
+        self.literal_app_id()
+            .map(|_| format!("way-pad-{pad_name}.desktop"))
+    }
 }
 
 impl Default for PadSpec {
@@ -146,6 +190,8 @@ impl Default for PadSpec {
             margin: 0,
             edge: None,
             fullscreen: false,
+            wm_class: None,
+            hide_mode: None,
         }
     }
 }

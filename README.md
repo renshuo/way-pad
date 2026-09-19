@@ -28,11 +28,13 @@ cargo install --path .        # 装到 ~/.cargo/bin
 # 自动探测后端：driftwm 会话用 driftwm IPC，否则用 foreign-toplevel 协议
 backend = "auto"                # auto | driftwm | foreign-toplevel
 
-| 隐藏方式（仅 driftwm 后端）：**推荐 `opacity`**——窗口原地全透明，不搬移窗口，
+# 隐藏方式（仅 driftwm 后端）：**推荐 `opacity`**——窗口原地全透明，不搬移窗口，
 # 对 zoom-to-fit、home 等全局视野操作零影响。`move` 会把窗口移到画布藏匿点，
 # 注意藏匿窗口会被 zoom-to-fit / zoom-to-fit-snapped / home-toggle 等
-# "适配全部窗口"的操作计入，导致视野飞向藏匿点
-hide_mode = "opacity"           # move | opacity
+# "适配全部窗口"的操作计入，导致视野飞向藏匿点。
+# `suspend` 用 driftwm 原生挂起：进程退出、原地留占位，显示时经 .desktop
+# 重启（way-pad 自动生成条目）——适合可恢复会话的应用（如 zellij）
+hide_mode = "opacity"           # move | opacity | suspend
 
 # driftwm 后端判断"窗口是否在当前视野内"所用的视口尺寸（显示器分辨率）
 viewport = [1920, 1080]
@@ -78,7 +80,7 @@ fullscreen = true
 | 字段 | 位置 | 说明 |
 |------|------|------|
 | `backend` | 顶层 | `auto` / `driftwm` / `foreign-toplevel`，默认 `auto` |
-| `hide_mode` | 顶层 | 隐藏方式：`move`（默认）/ `opacity`（仅 driftwm 后端）。**driftwm 用户建议 `opacity`** |
+| `hide_mode` | 顶层 / pad | 隐藏方式：`move`（默认）/ `opacity` / `suspend`（后两者仅 driftwm 后端）。**driftwm 用户建议 `opacity`**；可重启的应用（如 zellij 终端）可用 `suspend` |
 | `viewport` | 顶层 | 显示器分辨率（屏幕像素），driftwm 后端用于视野判断、百分比与全屏尺寸，默认 `[1920, 1080]` |
 | `launch_wait_ms` | 顶层 / pad | 自动启动后等待窗口出现的超时，默认 1500；pad 级覆盖顶层 |
 | `app_id` | pad | 匹配窗口 app_id 的正则，必填 |
@@ -100,12 +102,15 @@ fullscreen = true
 
 ## 两种隐藏方式的取舍（driftwm）
 
-| | `opacity`（推荐） | `move` |
-|---|---|---|
-| zoom-to-fit / home-toggle 等 | **零影响**（窗口原地参与计算） | 会被藏匿点窗口拉扯，视野飞向画布远端 |
-| 隐藏后窗口位置 | 原地不动 | 移到画布远端藏匿点 |
-| 鼠标点击 | 透明窗口通常仍会拦截点击 | 无此问题 |
-| 会话保存/恢复 | 窗口以原位保存 | 窗口以藏匿点坐标保存 |
+| | `opacity`（推荐） | `suspend` | `move` |
+|---|---|---|---|
+| zoom-to-fit / home-toggle 等 | **零影响**（窗口原地参与计算） | **零影响**（占位窗口在原地） | 会被藏匿点窗口拉扯，视野飞向画布远端 |
+| 隐藏后窗口位置 | 原地不动（透明） | 原地留占位窗口 | 移到画布远端藏匿点 |
+| 应用进程 | 存活，秒级切换 | **被关闭**，显示时经 .desktop 重启 | 存活，秒级切换 |
+| 应用状态 | 完整保留 | 取决于应用自身（zellij 会话 ✓、emacs ✗） | 完整保留 |
+| 鼠标点击 | 透明窗口通常仍会拦截点击 | 占位窗口可正常交互（点击/Enter 即重启） | 无此问题 |
+
+suspend 模式的额外要求：`launch` 会被写入 way-pad 自动生成的 `.desktop` 条目（`~/.local/share/applications/way-pad-<pad>.desktop`），应为**可重复执行的完整命令**且不含 shell 语法（如 `&&`、管道）；窗口类名默认取 `app_id` 正则的字面值，复杂正则需显式配置 `wm_class`。
 
 按键保护：同一 pad 的 way-pad 进程互斥（flock）——快速连按或按键重复时，后到的实例直接退出，不会开出多个窗口。
 
