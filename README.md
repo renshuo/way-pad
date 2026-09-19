@@ -28,9 +28,11 @@ cargo install --path .        # 装到 ~/.cargo/bin
 # 自动探测后端：driftwm 会话用 driftwm IPC，否则用 foreign-toplevel 协议
 backend = "auto"                # auto | driftwm | foreign-toplevel
 
-# 隐藏方式（仅 driftwm 后端）：move = 移到画布藏匿点（默认）；
-# opacity = 窗口原地全透明。注意：透明窗口通常仍会拦截鼠标点击
-hide_mode = "move"              # move | opacity
+| 隐藏方式（仅 driftwm 后端）：**推荐 `opacity`**——窗口原地全透明，不搬移窗口，
+# 对 zoom-to-fit、home 等全局视野操作零影响。`move` 会把窗口移到画布藏匿点，
+# 注意藏匿窗口会被 zoom-to-fit / zoom-to-fit-snapped / home-toggle 等
+# "适配全部窗口"的操作计入，导致视野飞向藏匿点
+hide_mode = "opacity"           # move | opacity
 
 # driftwm 后端判断"窗口是否在当前视野内"所用的视口尺寸（显示器分辨率）
 viewport = [1920, 1080]
@@ -76,7 +78,7 @@ fullscreen = true
 | 字段 | 位置 | 说明 |
 |------|------|------|
 | `backend` | 顶层 | `auto` / `driftwm` / `foreign-toplevel`，默认 `auto` |
-| `hide_mode` | 顶层 | 隐藏方式：`move`（默认）/ `opacity`（仅 driftwm 后端） |
+| `hide_mode` | 顶层 | 隐藏方式：`move`（默认）/ `opacity`（仅 driftwm 后端）。**driftwm 用户建议 `opacity`** |
 | `viewport` | 顶层 | 显示器分辨率（屏幕像素），driftwm 后端用于视野判断、百分比与全屏尺寸，默认 `[1920, 1080]` |
 | `launch_wait_ms` | 顶层 / pad | 自动启动后等待窗口出现的超时，默认 1500；pad 级覆盖顶层 |
 | `app_id` | pad | 匹配窗口 app_id 的正则，必填 |
@@ -95,6 +97,15 @@ fullscreen = true
 - **悬浮定位**：driftwm 的 focus 会把相机平移到窗口居中位（约 300ms 动画，无法抑制），若窗口先落到贴边/停靠位，聚焦时视野会往返晃动。way-pad 采用"先对焦、后停靠"——窗口先到视野中心与 focus 目标对齐（相机动画≈0），聚焦完成后再瞬移到最终停靠位，**全程视野稳定、无视图跳跃**（`WAY_PAD_DEBUG=1` 可查看定位日志）；
 - `fullscreen` 采用"占满视野"实现——driftwm 的真全屏窗口会脱离画布管理（IPC 无法再找到它），所以 way-pad 不使用真全屏，以保证隐藏/显示循环始终可用；
 - 几何与 `hide_mode = "opacity"` 在其他后端（foreign-toplevel）上会被忽略并给出提示。
+
+## 两种隐藏方式的取舍（driftwm）
+
+| | `opacity`（推荐） | `move` |
+|---|---|---|
+| zoom-to-fit / home-toggle 等 | **零影响**（窗口原地参与计算） | 会被藏匿点窗口拉扯，视野飞向画布远端 |
+| 隐藏后窗口位置 | 原地不动 | 移到画布远端藏匿点 |
+| 鼠标点击 | 透明窗口通常仍会拦截点击 | 无此问题 |
+| 会话保存/恢复 | 窗口以原位保存 | 窗口以藏匿点坐标保存 |
 
 按键保护：同一 pad 的 way-pad 进程互斥（flock）——快速连按或按键重复时，后到的实例直接退出，不会开出多个窗口。
 

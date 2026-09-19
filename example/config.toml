@@ -10,9 +10,11 @@
 backend = "auto"
 
 # 隐藏方式（仅 driftwm 后端支持 opacity）：
-#   move    — 窗口移到画布极远的藏匿点（默认）
-#   opacity — 窗口原地全透明（注意：透明窗口通常仍会拦截鼠标点击）
-hide_mode = "move"
+#   opacity — 窗口原地全透明（推荐）：不搬移窗口，zoom-to-fit / home 等
+#             全局视野操作零影响；注意透明窗口通常仍会拦截鼠标点击
+#   move    — 窗口移到画布极远的藏匿点：zoom-to-fit / home 等"适配全部
+#             窗口"的操作会被藏匿点窗口拉扯，导致视野飞向画布远端
+hide_mode = "opacity"
 
 # 显示器分辨率（屏幕像素）：driftwm 后端用于判断窗口是否在当前视野内、
 # 换算百分比尺寸、以及 fullscreen 的目标尺寸
